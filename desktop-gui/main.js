@@ -1,25 +1,21 @@
-// main.js
+// main.js v2.0 — DeepSeek Harness GUI
+//
 // Electron main process for the DeepSeek Harness (dsh) Web UI wrapper.
+// v2.0: Uses BackgroundService for dsh web server, Python/PowerShell detection,
+// service health monitoring, and graceful degradation.
 //
-// Responsibilities:
-//   1. Resolve Node.js (portable alongside repo, or system PATH).
-//   2. Spawn the `dsh web` backend as a HIDDEN child process.
-//   3. Wait until http://127.0.0.1:3080 responds, then load it in a BrowserWindow.
-//   4. Cleanly kill the dsh process tree on quit.
-//   5. Surface a dialog if dsh crashes / fails to start.
-//
-// ★ All child processes go through process-manager.js which guarantees
-//   windowsHide:true + shell:false — no black console window ever appears.
+// ALL child processes go through process-manager.js v2.0 → windowsHide:true + shell:false.
+// No black console window ever appears — not for Node, Python, PowerShell, or dsh backend.
 
-const { app, BrowserWindow, dialog, Menu } = require('electron');
+const { app, BrowserWindow, dialog, Menu, ipcMain } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const http = require('node:http');
 
-// Unified process manager — the ONE chokepoint for all process spawning.
+// Unified process manager v2.0 — the ONE chokepoint for all process spawning.
 const pm = require('./process-manager');
 
-// Load updater lazily - if it fails (e.g. proxy issues), the app still works.
+// Load updater lazily.
 let updater = null;
 try {
   updater = require('./updater');
@@ -29,33 +25,28 @@ try {
 
 // ---------------------------------------------------------------------------
 // Paths
-//   desktop-gui/           <- __dirname (APP_DIR)
-//   ..                      <- repo root = dsh source dir (DSH_DIR)
-//   ../../node-v22.19.0...  <- portable Node.js (optional, dev only)
-//   ../../portablegit/cmd   <- portable git (optional, dev only)
 // ---------------------------------------------------------------------------
 const APP_DIR = __dirname;
-const DSH_DIR = path.join(APP_DIR, '..');
-const PARENT_DIR = path.join(DSH_DIR, '..');
-const PORTABLE_NODE_DIR = path.join(PARENT_DIR, 'node-v22.19.0-win-x64');
-const PORTABLE_GIT_DIR = path.join(PARENT_DIR, 'portablegit', 'cmd');
+const ROOT_DIR = path.join(APP_DIR, '..');
+const NODE_DIR = path.join(ROOT_DIR, 'node-v22.19.0-win-x64');
+const GIT_CMD_DIR = path.join(ROOT_DIR, 'portablegit', 'cmd');
+const DSH_DIR = path.join(ROOT_DIR, 'deepseek-harness-master');
+const NODE_EXE = path.join(NODE_DIR, 'node.exe');
 
 const WEB_URL = 'http://127.0.0.1:3080';
 const WINDOW_TITLE = 'DeepSeek Harness';
 const SERVER_TIMEOUT_MS = 90 * 1000;
 const POLL_INTERVAL_MS = 500;
+const HEALTH_CHECK_INTERVAL_MS = 30 * 1000;
 
 // ---------------------------------------------------------------------------
-// Resolve Node.js executable (via process-manager, no black window)
+// Resolve Node.js executable
 // ---------------------------------------------------------------------------
 function resolveNodeExe() {
-  // 1. Portable Node alongside repo
-  const portableExe = path.join(PORTABLE_NODE_DIR, 'node.exe');
-  if (fs.existsSync(portableExe)) {
-    console.log('[node] using portable:', portableExe);
-    return portableExe;
+  if (fs.existsSync(NODE_EXE)) {
+    console.log('[node] using portable:', NODE_EXE);
+    return NODE_EXE;
   }
-  // 2. System Node via process-manager (hidden 'where' command)
   const sysNode = pm.resolveExecutable('node');
   if (sysNode) {
     console.log('[node] using system:', sysNode);
@@ -67,27 +58,31 @@ function resolveNodeExe() {
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
-let dshProcess = null;
+let dshService = null;       // BackgroundService for dsh web server
 let mainWindow = null;
 let isShuttingDown = false;
 let serverReady = false;
 let serverAlreadyRunning = false;
+let healthCheckTimer = null;
 const dshLogs = [];
+const runtimeInfo = {
+  node: null,
+  python: null,
+  git: null,
+  powershell: null,
+};
 
 // ---------------------------------------------------------------------------
-// Environment: prepend portable Node + git to PATH, and set
-// DSH_SPAWN_WINDOWS_HIDE=1 so the patched dsh backend hides its own children.
+// Environment: prepend portable Node + git to PATH, set DSH_SPAWN_WINDOWS_HIDE=1
 // ---------------------------------------------------------------------------
 function buildEnv() {
   const pathSep = process.platform === 'win32' ? ';' : ':';
   const extraPaths = [];
-  if (fs.existsSync(PORTABLE_NODE_DIR)) extraPaths.push(PORTABLE_NODE_DIR);
-  if (fs.existsSync(PORTABLE_GIT_DIR)) extraPaths.push(PORTABLE_GIT_DIR);
+  if (fs.existsSync(NODE_DIR)) extraPaths.push(NODE_DIR);
+  if (fs.existsSync(GIT_CMD_DIR)) extraPaths.push(GIT_CMD_DIR);
   const existingPath = process.env.PATH || '';
   const newPath = [...extraPaths, existingPath].filter(Boolean).join(pathSep);
 
-  // buildHiddenEnv sets DSH_SPAWN_WINDOWS_HIDE=1 which tells the patched dsh
-  // backend to add windowsHide:true to ALL of its own spawn calls.
   return pm.buildHiddenEnv({
     PATH: newPath,
     ELECTRON_RUN_AS_NODE: undefined,
@@ -95,7 +90,41 @@ function buildEnv() {
 }
 
 // ---------------------------------------------------------------------------
-// dsh backend management
+// Detect runtime tools at startup (Python, Git, PowerShell)
+// ---------------------------------------------------------------------------
+function detectRuntimes() {
+  // Node.js
+  runtimeInfo.node = resolveNodeExe();
+
+  // Python
+  runtimeInfo.python = pm.detectPython();
+  if (runtimeInfo.python) {
+    console.log(`[runtime] Python detected: ${runtimeInfo.python.exe} (${runtimeInfo.python.version})`);
+  } else {
+    console.log('[runtime] Python not found — Python-based plugins will be unavailable');
+  }
+
+  // Git
+  const gitExe = pm.resolveExecutable('git');
+  if (fs.existsSync(path.join(GIT_CMD_DIR, 'git.exe'))) {
+    runtimeInfo.git = path.join(GIT_CMD_DIR, 'git.exe');
+  } else if (gitExe) {
+    runtimeInfo.git = gitExe;
+  }
+  if (runtimeInfo.git) {
+    console.log('[runtime] Git detected:', runtimeInfo.git);
+  }
+
+  // PowerShell
+  const psExe = pm.resolveExecutable('powershell');
+  if (psExe) {
+    runtimeInfo.powershell = psExe;
+    console.log('[runtime] PowerShell detected:', psExe);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// dsh backend management via BackgroundService
 // ---------------------------------------------------------------------------
 function pushLog(chunk) {
   const text = chunk.toString();
@@ -119,29 +148,36 @@ function startDsh() {
 
   const args = ['--import', 'tsx/esm', 'apps/cli/src/bin.ts', 'web'];
 
-  // ★ Use process-manager's hiddenSpawn — guarantees windowsHide:true + shell:false
-  dshProcess = pm.hiddenSpawn(nodeExe, args, {
+  // ★ Register dsh as a BackgroundService — auto-restart on crash
+  dshService = pm.registerService('dsh-web', nodeExe, args, {
     cwd: DSH_DIR,
     env: buildEnv(),
     stdio: ['ignore', 'pipe', 'pipe'],
+    maxRestarts: 3,
+    autoRestart: true,
+    restartDelayMs: 2000,
   });
 
-  if (dshProcess.stdout) dshProcess.stdout.on('data', pushLog);
-  if (dshProcess.stderr) dshProcess.stderr.on('data', pushLog);
+  dshService.onOutput((stream, text) => {
+    pushLog(text);
+  });
 
-  dshProcess.on('exit', (code, signal) => {
-    console.log(`[dsh] process exited code=${code} signal=${signal}`);
+  dshService.onExit((code, signal) => {
+    console.log(`[dsh] service exited code=${code} signal=${signal}`);
     if (!isShuttingDown) {
       handleDshCrash(`dsh 进程意外退出（code=${code}, signal=${signal}）。`);
     }
   });
 
-  dshProcess.on('error', (err) => {
-    console.error('[dsh] failed to spawn:', err);
+  dshService.onError((err) => {
+    console.error('[dsh] service failed to spawn:', err);
     if (!isShuttingDown) {
       handleDshCrash(`无法启动 dsh 进程：\n${err.message}`);
     }
   });
+
+  // Start the service
+  dshService.start();
 }
 
 function handleDshCrash(reason) {
@@ -157,15 +193,49 @@ function handleDshCrash(reason) {
 }
 
 function killDsh() {
-  if (!dshProcess) return;
-  isShuttingDown = true;
-  const pid = dshProcess.pid;
-
-  // ★ Use process-manager's killProcessTree — hidden taskkill, no black window
-  if (pid) {
-    pm.killProcessTree(pid);
+  if (dshService) {
+    dshService.stop();
+    dshService = null;
   }
-  dshProcess = null;
+}
+
+// ---------------------------------------------------------------------------
+// Health monitoring — periodically check if dsh service is alive
+// ---------------------------------------------------------------------------
+function startHealthMonitor() {
+  if (healthCheckTimer) clearInterval(healthCheckTimer);
+
+  healthCheckTimer = setInterval(() => {
+    if (isShuttingDown) return;
+
+    const status = pm.healthCheck();
+    const dshStatus = status['dsh-web'];
+
+    if (dshStatus && !dshStatus.alive && serverReady) {
+      console.warn('[health] dsh-web service is down!');
+      // The BackgroundService auto-restart handles this, but we log it
+    }
+
+    // Send status to renderer if window is open
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('health-status', {
+        services: status,
+        runtimes: {
+          node: runtimeInfo.node ? 'OK' : 'missing',
+          python: runtimeInfo.python ? runtimeInfo.python.version : 'not found',
+          git: runtimeInfo.git ? 'OK' : 'missing',
+          powershell: runtimeInfo.powershell ? 'OK' : 'missing',
+        },
+      });
+    }
+  }, HEALTH_CHECK_INTERVAL_MS);
+}
+
+function stopHealthMonitor() {
+  if (healthCheckTimer) {
+    clearInterval(healthCheckTimer);
+    healthCheckTimer = null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -302,6 +372,8 @@ async function loadWebUI() {
       mainWindow.setTitle(WINDOW_TITLE);
       mainWindow.focus();
     }
+    // Start health monitoring after server is ready
+    startHealthMonitor();
   } catch (e) {
     const tail = dshLogs.slice(-40).join('').trim() || '(无输出)';
     dialog.showErrorBox(
@@ -316,7 +388,7 @@ async function loadWebUI() {
 }
 
 // ---------------------------------------------------------------------------
-// Application menu: includes manual update check
+// Application menu
 // ---------------------------------------------------------------------------
 function setupMenu() {
   const template = [
@@ -333,6 +405,45 @@ function setupMenu() {
             updater.checkAndPromptUpdate().catch((e) => {
               dialog.showErrorBox('检查更新失败', e.message);
             });
+          },
+        },
+        { type: 'separator' },
+        {
+          label: '运行时状态',
+          click: () => {
+            const status = pm.getStatus();
+            const runtimes = [
+              `Node.js: ${runtimeInfo.node || '未找到'}`,
+              `Python: ${runtimeInfo.python ? runtimeInfo.python.version + ' (' + runtimeInfo.python.exe + ')' : '未找到'}`,
+              `Git: ${runtimeInfo.git || '未找到'}`,
+              `PowerShell: ${runtimeInfo.powershell || '未找到'}`,
+            ];
+            const services = Object.entries(status.services).map(([name, s]) =>
+              `${name}: ${s.alive ? '运行中 (PID:' + s.pid + ')' : '已停止'} (重启次数: ${s.restarts})`
+            );
+            dialog.showMessageBoxSync({
+              type: 'info',
+              title: '运行时状态 - DeepSeek Harness',
+              message: '运行时环境',
+              detail: [...runtimes, '', '后台服务:', ...services].join('\n'),
+              buttons: ['确定'],
+            });
+          },
+        },
+        {
+          label: '重启 dsh 服务',
+          click: () => {
+            if (dshService) {
+              dialog.showMessageBoxSync({
+                type: 'info',
+                title: '重启服务',
+                message: '正在重启 dsh web 服务...',
+                buttons: ['确定'],
+              });
+              serverReady = false;
+              dshService.restart();
+              loadWebUI();
+            }
           },
         },
         { type: 'separator' },
@@ -358,6 +469,53 @@ function setupMenu() {
 }
 
 // ---------------------------------------------------------------------------
+// IPC handlers — allow renderer to query runtime info and run hidden commands
+// ---------------------------------------------------------------------------
+function setupIpc() {
+  ipcMain.handle('pm:getStatus', () => {
+    return pm.getStatus();
+  });
+
+  ipcMain.handle('pm:getRuntimes', () => {
+    return {
+      node: runtimeInfo.node,
+      python: runtimeInfo.python,
+      git: runtimeInfo.git,
+      powershell: runtimeInfo.powershell,
+    };
+  });
+
+  ipcMain.handle('pm:runPython', async (event, scriptPath, args, options) => {
+    try {
+      const child = pm.runPythonHidden(scriptPath, args || [], options || {});
+      let stdout = '';
+      let stderr = '';
+      if (child.stdout) child.stdout.on('data', (d) => { stdout += d.toString(); });
+      if (child.stderr) child.stderr.on('data', (d) => { stderr += d.toString(); });
+      return new Promise((resolve) => {
+        child.on('exit', (code) => resolve({ code, stdout, stderr }));
+        child.on('error', (err) => resolve({ code: -1, stdout, stderr: err.message }));
+      });
+    } catch (e) {
+      return { code: -1, stdout: '', stderr: e.message };
+    }
+  });
+
+  ipcMain.handle('pm:runPowerShell', async (event, command, options) => {
+    try {
+      const result = pm.runPowerShellHidden(command, options || {});
+      return {
+        code: result.status,
+        stdout: result.stdout,
+        stderr: result.stderr,
+      };
+    } catch (e) {
+      return { code: -1, stdout: '', stderr: e.message };
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
 // App lifecycle
 // ---------------------------------------------------------------------------
 const gotLock = app.requestSingleInstanceLock();
@@ -372,7 +530,11 @@ if (!gotLock) {
   });
 
   app.whenReady().then(async () => {
+    // Detect runtime tools first
+    detectRuntimes();
+
     setupMenu();
+    setupIpc();
 
     const alreadyUp = await isServerUp(WEB_URL, 1500);
     if (alreadyUp) {
@@ -384,8 +546,7 @@ if (!gotLock) {
     createWindow();
     await loadWebUI();
 
-    // After the UI is loaded, check for remote updates in the background.
-    // Delay 2s so the user sees the UI first before any update dialog.
+    // Check for updates after 2s
     setTimeout(() => {
       if (updater) {
         updater.checkAndPromptUpdate().catch((e) => {
@@ -405,12 +566,15 @@ if (!gotLock) {
   });
 
   app.on('before-quit', () => {
+    isShuttingDown = true;
+    stopHealthMonitor();
     killDsh();
-    // Kill any other tracked processes
     pm.killAll();
   });
 
   app.on('window-all-closed', () => {
+    isShuttingDown = true;
+    stopHealthMonitor();
     killDsh();
     pm.killAll();
     app.quit();

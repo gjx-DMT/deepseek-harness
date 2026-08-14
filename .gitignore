@@ -45,3 +45,5 @@ desktop-gui/node_modules/
 # Build output
 dist/
 *.exe
+
+desktop-gui/.version
