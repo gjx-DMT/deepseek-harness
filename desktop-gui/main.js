@@ -8,11 +8,12 @@
 //   4. Cleanly kill the dsh process tree on quit.
 //   5. Surface a dialog if dsh crashes / fails to start.
 
-const { app, BrowserWindow, dialog } = require('electron');
+const { app, BrowserWindow, dialog, Menu } = require('electron');
 const { spawn, execSync } = require('node:child_process');
 const path = require('node:path');
 const fs = require('node:fs');
 const http = require('node:http');
+const updater = require('./updater');
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -308,6 +309,44 @@ async function loadWebUI() {
 }
 
 // ---------------------------------------------------------------------------
+// Application menu: includes manual update check
+// ---------------------------------------------------------------------------
+function setupMenu() {
+  const template = [
+    {
+      label: 'DeepSeek Harness',
+      submenu: [
+        {
+          label: '检查更新',
+          click: () => {
+            updater.checkAndPromptUpdate().catch((e) => {
+              dialog.showErrorBox('检查更新失败', e.message);
+            });
+          },
+        },
+        { type: 'separator' },
+        { role: 'quit', label: '退出' },
+      ],
+    },
+    {
+      label: '视图',
+      submenu: [
+        { role: 'reload', label: '刷新页面' },
+        { role: 'toggleDevTools', label: '开发者工具' },
+        { type: 'separator' },
+        { role: 'resetZoom', label: '重置缩放' },
+        { role: 'zoomIn', label: '放大' },
+        { role: 'zoomOut', label: '缩小' },
+        { type: 'separator' },
+        { role: 'togglefullscreen', label: '全屏' },
+      ],
+    },
+  ];
+  const menu = Menu.buildFromTemplate(template);
+  Menu.setApplicationMenu(menu);
+}
+
+// ---------------------------------------------------------------------------
 // App lifecycle
 // ---------------------------------------------------------------------------
 const gotLock = app.requestSingleInstanceLock();
@@ -322,6 +361,8 @@ if (!gotLock) {
   });
 
   app.whenReady().then(async () => {
+    setupMenu();
+
     const alreadyUp = await isServerUp(WEB_URL, 1500);
     if (alreadyUp) {
       serverAlreadyRunning = true;
@@ -331,6 +372,14 @@ if (!gotLock) {
     }
     createWindow();
     await loadWebUI();
+
+    // After the UI is loaded, check for remote updates in the background.
+    // Delay 2s so the user sees the UI first before any update dialog.
+    setTimeout(() => {
+      updater.checkAndPromptUpdate().catch((e) => {
+        console.error('[updater] error:', e.message);
+      });
+    }, 2000);
   });
 
   app.on('activate', () => {
