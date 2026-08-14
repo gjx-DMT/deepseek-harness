@@ -1,0 +1,16 @@
+{
+  "name": "deepseek-harness-gui",
+  "version": "1.0.0",
+  "description": "Electron desktop wrapper for the DeepSeek Harness (dsh) Web UI",
+  "main": "main.js",
+  "author": "DeepSeek Harness GUI",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev"
+  },
+  "devDependencies": {
+    "electron": "^33.4.11"
+  }
+}
