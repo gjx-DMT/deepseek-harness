@@ -13,7 +13,14 @@ const { spawn, execSync } = require('node:child_process');
 const path = require('node:path');
 const fs = require('node:fs');
 const http = require('node:http');
-const updater = require('./updater');
+
+// Load updater lazily - if it fails (e.g. proxy issues), the app still works.
+let updater = null;
+try {
+  updater = require('./updater');
+} catch (e) {
+  console.warn('[updater] failed to load updater module:', e.message);
+}
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -319,6 +326,10 @@ function setupMenu() {
         {
           label: '检查更新',
           click: () => {
+            if (!updater) {
+              dialog.showErrorBox('检查更新失败', '更新模块未加载，请重启应用或检查网络设置。');
+              return;
+            }
             updater.checkAndPromptUpdate().catch((e) => {
               dialog.showErrorBox('检查更新失败', e.message);
             });
@@ -376,9 +387,11 @@ if (!gotLock) {
     // After the UI is loaded, check for remote updates in the background.
     // Delay 2s so the user sees the UI first before any update dialog.
     setTimeout(() => {
-      updater.checkAndPromptUpdate().catch((e) => {
-        console.error('[updater] error:', e.message);
-      });
+      if (updater) {
+        updater.checkAndPromptUpdate().catch((e) => {
+          console.error('[updater] error:', e.message);
+        });
+      }
     }, 2000);
   });
 

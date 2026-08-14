@@ -62,188 +62,102 @@ function saveLocalVersion(sha) {
 
 // ---------------------------------------------------------------------------
 // HTTP GET with system proxy support
-// Uses Node's https module with CONNECT proxy tunnel if a system proxy is set.
+// Uses Electron's built-in `net` module which respects the system proxy
+// (including PAC, WPAD, and manually configured proxies on Windows).
 // ---------------------------------------------------------------------------
 
-// Detect the Windows system proxy (same one PowerShell/Invoke-RestMethod uses).
-function getSystemProxy() {
-  try {
-    // Check environment variables first
-    if (process.env.HTTPS_PROXY) return process.env.HTTPS_PROXY;
-    if (process.env.https_proxy) return process.env.https_proxy;
-    if (process.env.HTTP_PROXY) return process.env.HTTP_PROXY;
-    if (process.env.http_proxy) return process.env.http_proxy;
-
-    // On Windows, read the registry for the system proxy
-    if (process.platform === 'win32') {
-      try {
-        const output = execSync(
-          'powershell -NoProfile -Command "[System.Net.WebRequest]::GetSystemWebProxy().GetProxy([Uri]\'https://github.com\').ToString()"',
-          { encoding: 'utf-8', timeout: 5000 },
-        ).trim();
-        if (output && output !== 'https://github.com/' && output.startsWith('http')) {
-          return output;
-        }
-      } catch (_) { /* ignore */ }
-    }
-  } catch (_) { /* ignore */ }
-  return null;
-}
-
-function httpGet(url, asBuffer = false) {
-  return new Promise((resolve, reject) => {
-    const parsedUrl = new URL(url);
-    const proxyUrl = getSystemProxy();
-
-    if (proxyUrl) {
-      // Use HTTP CONNECT tunnel through the proxy
-      const proxyParsed = new URL(proxyUrl);
-      const tunnelReq = require('node:net').connect({
-        host: proxyParsed.hostname,
-        port: proxyParsed.port || 80,
-      });
-
-      tunnelReq.setTimeout(30000, () => {
-        tunnelReq.destroy(new Error('Proxy connection timeout'));
-      });
-
-      tunnelReq.on('connect', (res, socket) => {
-        if (res.statusCode !== 200) {
-          reject(new Error(`Proxy CONNECT failed: ${res.statusCode}`));
-          return;
-        }
-
-        const tlsSocket = require('node:tls').connect({
-          socket,
-          servername: parsedUrl.hostname,
-        }, () => {
-          const reqPath = parsedUrl.pathname + parsedUrl.search;
-          const reqLines = [
-            `GET ${reqPath} HTTP/1.1`,
-            `Host: ${parsedUrl.hostname}`,
-            'User-Agent: DeepSeek-Harness-GUI-Updater',
-            'Accept: application/json',
-            'Connection: close',
-            '',
-            '',
-          ];
-          tlsSocket.write(reqLines.join('\r\n'));
-
-          let headersParsed = false;
-          let statusCode = 0;
-          let headerBuf = Buffer.alloc(0);
-          let bodyBuf = Buffer.alloc(0);
-
-          tlsSocket.on('data', (chunk) => {
-            if (!headersParsed) {
-              headerBuf = Buffer.concat([headerBuf, chunk]);
-              const headerEnd = headerBuf.indexOf('\r\n\r\n');
-              if (headerEnd !== -1) {
-                const headerStr = headerBuf.slice(0, headerEnd).toString();
-                const statusLine = headerStr.split('\r\n')[0];
-                statusCode = parseInt(statusLine.split(' ')[1], 10);
-                bodyBuf = headerBuf.slice(headerEnd + 4);
-                headersParsed = true;
-
-                if (asBuffer && (statusCode === 200 || statusCode === 302)) {
-                  // For binary downloads, resolve with the response directly
-                  if (statusCode === 302) {
-                    // Follow redirect
-                    const locationMatch = headerStr.match(/location:\s*(.*)/i);
-                    if (locationMatch) {
-                      const redirectUrl = locationMatch[1].trim();
-                      tlsSocket.destroy();
-                      httpGet(redirectUrl, asBuffer).then(resolve).catch(reject);
-                      return;
-                    }
-                  }
-                }
-              }
-            } else {
-              bodyBuf = Buffer.concat([bodyBuf, chunk]);
-            }
-          });
-
-          tlsSocket.on('end', () => {
-            if (statusCode >= 300 && statusCode < 400 && !asBuffer) {
-              // Follow redirect for JSON
-              const headerStr = headerBuf.toString();
-              const locationMatch = headerStr.match(/location:\s*(.*)/i);
-              if (locationMatch) {
-                const redirectUrl = locationMatch[1].trim();
-                httpGet(redirectUrl, asBuffer).then(resolve).catch(reject);
-                return;
-              }
-            }
-            if (asBuffer) {
-              resolve(bodyBuf);
-            } else {
-              try {
-                resolve(JSON.parse(bodyBuf.toString('utf-8')));
-              } catch (e) {
-                reject(new Error(`Failed to parse response (status ${statusCode}): ${e.message}`));
-              }
-            }
-          });
-
-          tlsSocket.on('error', reject);
-        });
-
-        tlsSocket.on('error', reject);
-      });
-
-      tunnelReq.on('error', reject);
-      tunnelReq.write(
-        `CONNECT ${parsedUrl.hostname}:443 HTTP/1.1\r\n` +
-        `Host: ${parsedUrl.hostname}:443\r\n` +
-        `Proxy-Connection: keep-alive\r\n\r\n`,
-      );
-    } else {
-      // Direct connection, no proxy
-      const https = require('node:https');
-      const req = https.get(url, {
-        headers: {
-          'User-Agent': 'DeepSeek-Harness-GUI-Updater',
-          'Accept': 'application/json',
-        },
-      }, (res) => {
-        if (res.statusCode >= 300 && res.statusCode < 400) {
-          const location = res.headers.location;
-          if (location) {
-            res.destroy();
-            httpGet(location, asBuffer).then(resolve).catch(reject);
-            return;
-          }
-        }
-        const chunks = [];
-        res.on('data', (chunk) => chunks.push(chunk));
-        res.on('end', () => {
-          const buf = Buffer.concat(chunks);
-          if (asBuffer) {
-            resolve(buf);
-          } else {
-            try {
-              resolve(JSON.parse(buf.toString('utf-8')));
-            } catch (e) {
-              reject(new Error(`Failed to parse response: ${e.message}`));
-            }
-          }
-        });
-      });
-      req.on('error', reject);
-      req.setTimeout(30000, () => {
-        req.destroy(new Error('Request timeout'));
-      });
-    }
-  });
+function makeRequest(url, method = 'GET', headers = {}) {
+  const { net } = require('electron');
+  return net.request({ url, method, headers });
 }
 
 function httpGetJson(url) {
-  return httpGet(url, false);
+  return new Promise((resolve, reject) => {
+    const request = makeRequest(url, 'GET', {
+      'User-Agent': 'DeepSeek-Harness-GUI-Updater',
+      'Accept': 'application/json',
+    });
+
+    let body = '';
+    request.on('response', (response) => {
+      const statusCode = response.statusCode;
+
+      // Follow redirects
+      if (statusCode >= 300 && statusCode < 400) {
+        const location = response.headers.location;
+        if (Array.isArray(location)) location = location[0];
+        if (location) {
+          // Consume the body to avoid leaks
+          response.on('data', () => {});
+          response.on('end', () => {
+            httpGetJson(location).then(resolve).catch(reject);
+          });
+          return;
+        }
+      }
+
+      response.on('data', (chunk) => { body += chunk.toString('utf-8'); });
+      response.on('end', () => {
+        if (statusCode >= 400) {
+          reject(new Error(`HTTP ${statusCode}: ${body.substring(0, 200)}`));
+          return;
+        }
+        try {
+          resolve(JSON.parse(body));
+        } catch (e) {
+          reject(new Error(`Failed to parse JSON: ${e.message}. Body: ${body.substring(0, 200)}`));
+        }
+      });
+    });
+
+    request.on('error', (err) => {
+      reject(new Error(`Request error: ${err.message}`));
+    });
+
+    request.end();
+  });
 }
 
 function httpGetBuffer(url) {
-  return httpGet(url, true);
+  return new Promise((resolve, reject) => {
+    const request = makeRequest(url, 'GET', {
+      'User-Agent': 'DeepSeek-Harness-GUI-Updater',
+    });
+
+    const chunks = [];
+    request.on('response', (response) => {
+      const statusCode = response.statusCode;
+
+      // Follow redirects
+      if (statusCode >= 300 && statusCode < 400) {
+        const location = response.headers.location;
+        if (Array.isArray(location)) location = location[0];
+        if (location) {
+          response.on('data', () => {});
+          response.on('end', () => {
+            httpGetBuffer(location).then(resolve).catch(reject);
+          });
+          return;
+        }
+      }
+
+      if (statusCode >= 400) {
+        reject(new Error(`HTTP ${statusCode}`));
+        return;
+      }
+
+      response.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+      response.on('end', () => {
+        resolve(Buffer.concat(chunks));
+      });
+    });
+
+    request.on('error', (err) => {
+      reject(new Error(`Request error: ${err.message}`));
+    });
+
+    request.end();
+  });
 }
 
 // ---------------------------------------------------------------------------
