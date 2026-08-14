@@ -126,10 +126,13 @@ export function runPlugin(profile: string, args: readonly string[]): number {
   const before = readProfileManifest(NAME, dir)
   // Windows resolves pnpm through its .cmd shim, which spawn() refuses
   // without a shell since the CVE-2024-27980 hardening.
+  // ★ Patched: windowsHide:true prevents a black console window from flashing
+  // when pnpm/cmd.exe runs. No-op on non-Windows.
   const result = spawnSync('pnpm', args.map(argument => anchorPathSpec(argument, process.cwd())), {
     cwd: dir,
     stdio: 'inherit',
     shell: process.platform === 'win32',
+    windowsHide: true,
   })
   if (result.error !== undefined) {
     const code = (result.error as NodeJS.ErrnoException).code

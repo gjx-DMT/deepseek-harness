@@ -3,16 +3,21 @@
 //
 // Responsibilities:
 //   1. Resolve Node.js (portable alongside repo, or system PATH).
-//   2. Spawn the `dsh web` backend as a child process.
+//   2. Spawn the `dsh web` backend as a HIDDEN child process.
 //   3. Wait until http://127.0.0.1:3080 responds, then load it in a BrowserWindow.
 //   4. Cleanly kill the dsh process tree on quit.
 //   5. Surface a dialog if dsh crashes / fails to start.
+//
+// ★ All child processes go through process-manager.js which guarantees
+//   windowsHide:true + shell:false — no black console window ever appears.
 
 const { app, BrowserWindow, dialog, Menu } = require('electron');
-const { spawn, execSync } = require('node:child_process');
 const path = require('node:path');
 const fs = require('node:fs');
 const http = require('node:http');
+
+// Unified process manager — the ONE chokepoint for all process spawning.
+const pm = require('./process-manager');
 
 // Load updater lazily - if it fails (e.g. proxy issues), the app still works.
 let updater = null;
@@ -41,24 +46,21 @@ const SERVER_TIMEOUT_MS = 90 * 1000;
 const POLL_INTERVAL_MS = 500;
 
 // ---------------------------------------------------------------------------
-// Resolve Node.js executable
-//   1. Portable Node alongside repo (dev environment)
-//   2. System Node in PATH (cloned-from-GitHub environment)
+// Resolve Node.js executable (via process-manager, no black window)
 // ---------------------------------------------------------------------------
 function resolveNodeExe() {
+  // 1. Portable Node alongside repo
   const portableExe = path.join(PORTABLE_NODE_DIR, 'node.exe');
   if (fs.existsSync(portableExe)) {
     console.log('[node] using portable:', portableExe);
     return portableExe;
   }
-  // Fall back to system Node
-  try {
-    const sysNode = execSync('where node', { encoding: 'utf-8' }).trim().split(/\r?\n/)[0];
-    if (sysNode && fs.existsSync(sysNode)) {
-      console.log('[node] using system:', sysNode);
-      return sysNode;
-    }
-  } catch (_) { /* not in PATH */ }
+  // 2. System Node via process-manager (hidden 'where' command)
+  const sysNode = pm.resolveExecutable('node');
+  if (sysNode) {
+    console.log('[node] using system:', sysNode);
+    return sysNode;
+  }
   return null;
 }
 
@@ -73,7 +75,8 @@ let serverAlreadyRunning = false;
 const dshLogs = [];
 
 // ---------------------------------------------------------------------------
-// Environment: prepend portable Node + git to PATH if available
+// Environment: prepend portable Node + git to PATH, and set
+// DSH_SPAWN_WINDOWS_HIDE=1 so the patched dsh backend hides its own children.
 // ---------------------------------------------------------------------------
 function buildEnv() {
   const pathSep = process.platform === 'win32' ? ';' : ':';
@@ -82,11 +85,13 @@ function buildEnv() {
   if (fs.existsSync(PORTABLE_GIT_DIR)) extraPaths.push(PORTABLE_GIT_DIR);
   const existingPath = process.env.PATH || '';
   const newPath = [...extraPaths, existingPath].filter(Boolean).join(pathSep);
-  return {
-    ...process.env,
+
+  // buildHiddenEnv sets DSH_SPAWN_WINDOWS_HIDE=1 which tells the patched dsh
+  // backend to add windowsHide:true to ALL of its own spawn calls.
+  return pm.buildHiddenEnv({
     PATH: newPath,
     ELECTRON_RUN_AS_NODE: undefined,
-  };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -113,11 +118,11 @@ function startDsh() {
   }
 
   const args = ['--import', 'tsx/esm', 'apps/cli/src/bin.ts', 'web'];
-  dshProcess = spawn(nodeExe, args, {
+
+  // ★ Use process-manager's hiddenSpawn — guarantees windowsHide:true + shell:false
+  dshProcess = pm.hiddenSpawn(nodeExe, args, {
     cwd: DSH_DIR,
     env: buildEnv(),
-    shell: false,
-    windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 
@@ -155,17 +160,12 @@ function killDsh() {
   if (!dshProcess) return;
   isShuttingDown = true;
   const pid = dshProcess.pid;
-  try {
-    if (process.platform === 'win32') {
-      execSync(`taskkill /PID ${pid} /T /F`, { stdio: 'ignore' });
-    } else {
-      try { dshProcess.kill('SIGTERM'); } catch (_) { /* ignore */ }
-    }
-  } catch (e) {
-    console.log('[dsh] kill notice (probably already dead):', e.message);
-  } finally {
-    dshProcess = null;
+
+  // ★ Use process-manager's killProcessTree — hidden taskkill, no black window
+  if (pid) {
+    pm.killProcessTree(pid);
   }
+  dshProcess = null;
 }
 
 // ---------------------------------------------------------------------------
@@ -406,10 +406,13 @@ if (!gotLock) {
 
   app.on('before-quit', () => {
     killDsh();
+    // Kill any other tracked processes
+    pm.killAll();
   });
 
   app.on('window-all-closed', () => {
     killDsh();
+    pm.killAll();
     app.quit();
   });
 }

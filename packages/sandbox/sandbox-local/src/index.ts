@@ -69,6 +69,7 @@ function defaultProbeBwrap(timeoutMs: number): boolean {
   const probe = spawnSync('bwrap', ['--ro-bind', '/', '/', '--dev', '/dev', '--proc', '/proc', '--die-with-parent', '--', 'true'], {
     timeout: timeoutMs,
     stdio: 'ignore',
+    windowsHide: true, // ★ Patched: prevent black console window on Windows
   })
   return probe.status === 0
 }
@@ -86,6 +87,7 @@ function defaultProbeSeatbelt(seatbeltExec: string, timeoutMs: number): boolean 
   const probe = spawnSync(seatbeltExec, [...seatbeltProfileArgs({ mode: 'read-only', workspaceRoot: '/' }), '--', 'true'], {
     timeout: timeoutMs,
     stdio: 'ignore',
+    windowsHide: true, // ★ Patched: prevent black console window on Windows
   })
   return probe.status === 0
 }
@@ -107,6 +109,7 @@ function defaultProbeWindowsAcl(runnerInvocation: string[], timeoutMs: number): 
   ], {
     timeout: timeoutMs,
     stdio: 'ignore',
+    windowsHide: true, // ★ Patched: prevent black console window on Windows
   })
   return probe.status === 0
 }
